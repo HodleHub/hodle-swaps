@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import chalk from 'chalk';
 import colorize from 'json-colorizer';
 import readline from 'readline';
+import { EventEmitter } from 'events';
 
 type BalanceNotification = {
   Notif: {
@@ -133,6 +134,7 @@ let balances: Record<string, number> = {};
 const activeSwaps: Map<string, Swap> = new Map();
 let ws: WebSocket | null = null;
 let shouldContinue = true;
+const responseEmitter = new EventEmitter();
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -206,6 +208,8 @@ const handleBalancesNotification = async (balancesData: Record<string, number>):
   balances = balancesData;
   logger.success('Balances updated:');
   
+  console.log({ balances})
+
   if (Object.keys(balances).length === 0) {
     logger.warn('No balances available');
     const shouldRefetch = await askYesOrNo('No balances available. Would you like to refetch?');
@@ -239,11 +243,13 @@ const handleGetQuoteResponse = (quote: GetQuoteResponse['Resp']['resp']['GetQuot
   console.log(chalk.cyan('Receive amount: ') + chalk.yellow(quote.recv_amount.toString()));
   console.log(chalk.cyan('TTL: ') + chalk.yellow(`${quote.ttl}s`));
   console.log(chalk.cyan('TXID: ') + chalk.yellow(quote.txid));
+  responseEmitter.emit('quote_response', { id: quote.quote_id, txid: quote.txid, recv_amount: quote.recv_amount });
 };
 
 const handleAcceptQuoteResponse = (acceptedQuote: AcceptQuoteResponse['Resp']['resp']['AcceptQuote']): void => {
   logger.success('Quote accepted:');
   console.log(chalk.cyan('TXID: ') + chalk.yellow(acceptedQuote.txid));
+  responseEmitter.emit('accept_quote_response', acceptedQuote.txid);
 };
 
 const getStatusColor = (status: Swap['status']): Function => {
@@ -269,6 +275,7 @@ const handleGetSwapsResponse = (swaps: Swap[]): void => {
     const statusColor = getStatusColor(swap.status);
     console.log(chalk.cyan('TXID: ') + chalk.gray(swap.txid) + chalk.cyan(' Status: ') + statusColor(swap.status));
   }
+  responseEmitter.emit('swaps_response', swaps);
 };
 
 const handleErrorResponse = (error: ErrorResponse['Error']): void => {
@@ -278,6 +285,7 @@ const handleErrorResponse = (error: ErrorResponse['Error']): void => {
   if (error.err.details) {
     logger.json('Error details:', error.err.details);
   }
+  responseEmitter.emit('error_response', error);
 };
 
 const handleResponseMessage = (resp: any): void => {
@@ -428,7 +436,110 @@ const processSwap = async (ws: WebSocket): Promise<void> => {
   }
   
   logger.success(`Found sufficient balance for ${sendAsset}. Proceeding with swap...`);
+  logger.info(`Requesting quote: ${sendAmount} ${sendAsset} ➡️ ${recvAsset}`);
+  
+  // Variable to store transaction ID
+  let txid: string | null = null;
+  
+  // Create a promise that will be resolved when a quote response is received
+  const quotePromise = new Promise<{ id: number, txid: string, recv_amount: number } | null>((resolve) => {
+    // Set up one-time event listener for quote response
+    responseEmitter.once('quote_response', (quoteData) => {
+      resolve(quoteData);
+    });
+    
+    // Set up one-time event listener for error response
+    responseEmitter.once('error_response', (error) => {
+      if (error.err.text.includes('Quote error')) {
+        resolve(null);
+      }
+    });
+  });
+  
+  // Request the quote
   await getQuote(ws, sendAsset, sendAmount, recvAsset, address);
+  
+  // Wait for the quote response
+  const quoteData = await quotePromise;
+  
+  // If no quote data, exit
+  if (!quoteData) {
+    logger.error('Failed to get a valid quote. Operation cancelled.');
+    return;
+  }
+  
+  // Ask user to accept the quote
+  logger.success(`Quote received: You will get ${quoteData.recv_amount} ${recvAsset}`);
+  const shouldAccept = await askYesOrNo('Do you want to accept this quote?');
+  
+  if (!shouldAccept) {
+    logger.warn('Quote rejected by user. Operation cancelled.');
+    return;
+  }
+  
+  // Create a promise that will be resolved when the quote is accepted
+  const acceptPromise = new Promise<string>((resolve) => {
+    // Set up one-time event listener for accept quote response
+    responseEmitter.once('accept_quote_response', (txid) => {
+      resolve(txid);
+    });
+  });
+  
+  // Accept the quote
+  logger.info(`Accepting quote ${quoteData.id}...`);
+  acceptQuote(ws, quoteData.id);
+  
+  // Wait for the accept response
+  txid = await acceptPromise;
+  logger.success(`Quote accepted! Transaction ID: ${txid}`);
+  
+  // Monitor the swap status
+  let swapStatus = 'NotFound';
+  let attempts = 0;
+  const maxAttempts = 10;
+  
+  while (attempts < maxAttempts && swapStatus !== 'Confirmed') {
+    // Wait for a few seconds before checking
+    logger.info(`Checking swap status (attempt ${attempts + 1}/${maxAttempts})...`);
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    
+    // Create a promise that will be resolved when swap status is received
+    const swapsPromise = new Promise<Swap[]>((resolve) => {
+      // Set up one-time event listener for swaps response
+      responseEmitter.once('swaps_response', (swaps) => {
+        resolve(swaps);
+      });
+    });
+    
+    // Get the swap status
+    getSwaps(ws);
+    
+    // Wait for the swaps response
+    const swaps = await swapsPromise;
+    
+    // Find the swap with our txid
+    const ourSwap = swaps.find(swap => swap.txid === txid);
+    
+    if (ourSwap) {
+      swapStatus = ourSwap.status;
+      logger.info(`Swap status: ${swapStatus}`);
+      
+      if (swapStatus === 'Confirmed') {
+        logger.success('Swap completed successfully!');
+        break;
+      } else if (swapStatus === 'Mempool') {
+        logger.info('Swap is in mempool. Waiting for confirmation...');
+      }
+    } else {
+      logger.warn('Swap not found. It might take some time to appear in the system.');
+    }
+    
+    attempts++;
+  }
+  
+  if (swapStatus !== 'Confirmed') {
+    logger.warn('Swap has not been confirmed yet. You can check its status later using the GetSwaps command.');
+  }
 };
 
 const main = async (): Promise<void> => {
